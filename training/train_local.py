@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -10,11 +12,50 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from dotenv import load_dotenv
-from huggingface_hub import upload_folder
 
-from agents.llm_agent import LLMAgent
 from config.settings import ROOT_DIR, load_settings
 from environment.platoon_env import PlatoonEnv
+
+ACTION_REGEX = re.compile(
+    r"ACTION:\s*accel_pedal:\s*([0-9]*\.?[0-9]+)\s*brake_pedal:\s*([0-9]*\.?[0-9]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+GAP_ERROR_REGEX = re.compile(r"gap_error:\s*([+\-]?[0-9]*\.?[0-9]+)")
+EGO_VEL_REGEX = re.compile(r"ego_velocity:\s*([0-9]*\.?[0-9]+)")
+FRONT_VEL_REGEX = re.compile(r"front_velocity:\s*([+\-]?[0-9]*\.?[0-9]+)")
+
+
+def _import_torch() -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency torch. Install requirements in WSL2 and retry."
+        ) from exc
+    return torch
+
+
+def _import_training_stack() -> dict[str, Any]:
+    try:
+        from datasets import Dataset
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+        from trl import SFTTrainer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing ML training dependencies. Install requirements.txt in WSL2 before running training."
+        ) from exc
+
+    return {
+        "Dataset": Dataset,
+        "LoraConfig": LoraConfig,
+        "get_peft_model": get_peft_model,
+        "AutoModelForCausalLM": AutoModelForCausalLM,
+        "AutoTokenizer": AutoTokenizer,
+        "TrainingArguments": TrainingArguments,
+        "SFTTrainer": SFTTrainer,
+    }
 
 
 @dataclass
@@ -27,7 +68,16 @@ class EpisodeMetrics:
     mean_reward: float
     final_gap_error_agent_1: float
     final_gap_error_agent_2: float
+    mean_jerk: float
     parse_failures: int
+    parse_failure_rate: float
+
+
+@dataclass
+class RolloutSample:
+    prompt: str
+    action_text: str
+    reward: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,14 +90,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--grpo-update-every", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--adapter", type=str, default=None)
+    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--lr-sft", type=float, default=2e-4)
+    parser.add_argument("--lr-rl", type=float, default=5e-6)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--reset-metrics", action="store_true")
     return parser.parse_args()
 
 
 def seed_everything(seed: int) -> None:
+    torch = _import_torch()
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -56,7 +118,306 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def run_episode(env: PlatoonEnv, agent: LLMAgent, episode_seed: int, temperature: float = 0.0) -> EpisodeMetrics:
+def read_hf_username() -> str:
+    return os.getenv("HF_USERNAME", "").strip()
+
+
+def maybe_upload(local_dir: Path, repo_id: str, commit_message: str) -> None:
+    if not local_dir.exists() or not repo_id:
+        return
+    try:
+        from huggingface_hub import upload_folder
+
+        upload_folder(
+            folder_path=str(local_dir),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+        )
+    except Exception as exc:
+        print(f"[WARN] HF upload failed for {repo_id}: {exc}")
+
+
+def load_base_model_and_tokenizer(base_model: str, max_seq_len: int) -> tuple[Any, Any]:
+    torch = _import_torch()
+    stack = _import_training_stack()
+
+    AutoTokenizer = stack["AutoTokenizer"]
+    AutoModelForCausalLM = stack["AutoModelForCausalLM"]
+    LoraConfig = stack["LoraConfig"]
+    get_peft_model = stack["get_peft_model"]
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        trust_remote_code=True,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+
+    lora_cfg = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.config.use_cache = False
+    tokenizer.model_max_length = max_seq_len
+    return model, tokenizer
+
+
+def build_sft_dataset(dataset_path: Path) -> Dataset:
+    Dataset = _import_training_stack()["Dataset"]
+
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"SFT dataset not found: {dataset_path}")
+
+    rows: list[dict[str, str]] = []
+    with dataset_path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            item = json.loads(text)
+            required = {
+                "id",
+                "scenario",
+                "phase",
+                "agent_id",
+                "timestep",
+                "observation_text",
+                "reasoning",
+                "action_text",
+            }
+            missing = required - set(item.keys())
+            if missing:
+                raise ValueError(f"Invalid SFT record at line {index}, missing {sorted(missing)}")
+
+            rows.append(
+                {
+                    "text": (
+                        f"{item['observation_text']}\n"
+                        f"Reasoning:\n{item['reasoning']}\n"
+                        f"{item['action_text']}"
+                    )
+                }
+            )
+
+    if not rows:
+        raise ValueError("SFT dataset is empty")
+
+    return Dataset.from_list(rows)
+
+
+def run_sft(args: argparse.Namespace) -> None:
+    torch = _import_torch()
+    stack = _import_training_stack()
+    TrainingArguments = stack["TrainingArguments"]
+    SFTTrainer = stack["SFTTrainer"]
+
+    print("Starting SFT fine-tuning")
+    data_path = ROOT_DIR / "data" / "sft" / "scenario_01.jsonl"
+    output_dir = ROOT_DIR / "checkpoints" / "sft_final"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = build_sft_dataset(data_path)
+    model, tokenizer = load_base_model_and_tokenizer(args.base_model, args.max_seq_len)
+
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr_sft,
+        num_train_epochs=args.epochs,
+        warmup_steps=100,
+        lr_scheduler_type="cosine",
+        logging_steps=10,
+        save_strategy="epoch",
+        bf16=torch.cuda.is_available(),
+        fp16=not torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
+        report_to="none",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=args.max_seq_len,
+        args=training_args,
+    )
+
+    trainer.train()
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+
+    hf_username = read_hf_username()
+    if hf_username and hf_username != "your_hf_username":
+        maybe_upload(output_dir, f"{hf_username}/platoon-qwen-sft", "Upload SFT adapter")
+
+    print(f"SFT finished. Saved checkpoint: {output_dir}")
+
+
+def score_action_from_prompt(prompt: str, action_text: str) -> float:
+    match = ACTION_REGEX.search(action_text)
+    if not match:
+        return -8.0
+
+    accel = float(np.clip(float(match.group(1)), 0.0, 1.0))
+    brake = float(np.clip(float(match.group(2)), 0.0, 1.0))
+
+    if accel > 0.0 and brake > 0.0:
+        accel = 0.0
+
+    gap_error_match = GAP_ERROR_REGEX.search(prompt)
+    ego_vel_match = EGO_VEL_REGEX.search(prompt)
+    front_vel_match = FRONT_VEL_REGEX.search(prompt)
+
+    if not gap_error_match or not ego_vel_match or not front_vel_match:
+        return -4.0
+
+    gap_error = float(gap_error_match.group(1))
+    ego_vel = float(ego_vel_match.group(1))
+    front_vel = float(front_vel_match.group(1))
+
+    net_accel = (accel * 3.0) - (brake * 8.0)
+    relative_speed = ego_vel - front_vel
+
+    target_brake = max(0.0, min(1.0, (max(0.0, -gap_error) / 10.0) + (max(0.0, relative_speed) / 12.0)))
+    target_accel = max(0.0, min(1.0, gap_error / 18.0)) if gap_error > 1.0 else 0.0
+
+    action_mismatch = abs(brake - target_brake) + abs(accel - target_accel)
+    jerk_proxy = abs(net_accel)
+    safety_penalty = 8.0 if gap_error < -6.0 and brake < 0.4 else 0.0
+
+    reward = -action_mismatch - (0.06 * jerk_proxy) - safety_penalty
+    if abs(gap_error) < 1.0:
+        reward += 1.5
+    return float(reward)
+
+
+def choose_group_best_actions(agent: LLMAgent, prompts: list[str], group_size: int) -> list[RolloutSample]:
+    selected: list[RolloutSample] = []
+    for prompt in prompts:
+        candidates: list[RolloutSample] = []
+        for _ in range(group_size):
+            out = agent.act(prompt, temperature=0.7)
+            reward = score_action_from_prompt(prompt, out.action_text)
+            candidates.append(RolloutSample(prompt=prompt, action_text=out.action_text, reward=reward))
+
+        best = sorted(candidates, key=lambda row: row.reward, reverse=True)[0]
+        selected.append(best)
+    return selected
+
+
+def apply_grpo_style_update(
+    model: Any,
+    tokenizer: Any,
+    samples: list[RolloutSample],
+    output_dir: Path,
+    lr: float,
+    max_seq_len: int,
+    batch_size: int,
+    grad_accum: int,
+) -> None:
+    torch = _import_torch()
+    stack = _import_training_stack()
+    Dataset = stack["Dataset"]
+    TrainingArguments = stack["TrainingArguments"]
+    SFTTrainer = stack["SFTTrainer"]
+
+    if not samples:
+        return
+
+    data = [{"text": f"{sample.prompt}\n{sample.action_text}"} for sample in samples]
+    dataset = Dataset.from_list(data)
+
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
+        learning_rate=lr,
+        num_train_epochs=1,
+        logging_steps=5,
+        save_strategy="no",
+        report_to="none",
+        bf16=torch.cuda.is_available(),
+        fp16=not torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=max_seq_len,
+        args=training_args,
+    )
+    trainer.train()
+
+
+def try_native_grpo_update(
+    model: Any,
+    tokenizer: Any,
+    prompts: list[str],
+    output_dir: Path,
+    lr: float,
+    batch_size: int,
+    grad_accum: int,
+    group_size: int,
+) -> tuple[bool, str]:
+    if not prompts:
+        return False, "no_prompts"
+
+    try:
+        from datasets import Dataset
+        from trl import GRPOConfig, GRPOTrainer
+    except Exception:
+        return False, "grpo_unavailable"
+
+    prompt_dataset = Dataset.from_list([{"prompt": prompt} for prompt in prompts])
+
+    def reward_fn(completions: list[str], prompts: list[str], **_: Any) -> list[float]:
+        return [score_action_from_prompt(prompt, completion) for prompt, completion in zip(prompts, completions)]
+
+    try:
+        grpo_args = GRPOConfig(
+            output_dir=str(output_dir),
+            learning_rate=lr,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            num_generations=max(2, group_size),
+            max_completion_length=64,
+            logging_steps=5,
+            report_to=[],
+        )
+
+        trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=reward_fn,
+            train_dataset=prompt_dataset,
+            args=grpo_args,
+            processing_class=tokenizer,
+        )
+        trainer.train()
+    except Exception as exc:
+        return False, f"grpo_runtime_error:{exc}"
+
+    return True, "grpo_native"
+
+
+def run_episode(
+    env: PlatoonEnv,
+    agent: LLMAgent,
+    episode_seed: int,
+    temperature: float,
+    collect_prompts: bool,
+) -> tuple[EpisodeMetrics, list[str]]:
     obs = env.reset(seed=episode_seed)
     done = False
     step_count = 0
@@ -64,10 +425,16 @@ def run_episode(env: PlatoonEnv, agent: LLMAgent, episode_seed: int, temperature
     total_r1 = 0.0
     total_r2 = 0.0
     parse_failures = 0
+    jerk_values: list[float] = []
     final_gap_err_1 = 0.0
     final_gap_err_2 = 0.0
+    prompts: list[str] = []
 
     while not done:
+        if collect_prompts:
+            prompts.append(obs["agent_1"])
+            prompts.append(obs["agent_2"])
+
         out_1 = agent.act(obs["agent_1"], temperature=temperature)
         out_2 = agent.act(obs["agent_2"], temperature=temperature)
         if not out_1.parse_ok:
@@ -87,12 +454,19 @@ def run_episode(env: PlatoonEnv, agent: LLMAgent, episode_seed: int, temperature
         final_gap_err_1 = float(infos["agent_1"]["gap_error"])
         final_gap_err_2 = float(infos["agent_2"]["gap_error"])
 
+        jerk_values.append(abs(float(env.state()["vehicles"][1]["net_acceleration"])))
+        jerk_values.append(abs(float(env.state()["vehicles"][2]["net_acceleration"])))
+
         step_count += 1
-        done = dones["agent_1"]
+        done = bool(dones["agent_1"])
 
-    collision = env.state()["vehicles"][1]["x"] + env.settings["simulation"]["vehicle_length"] >= env.state()["vehicles"][0]["x"]
+    vehicle_state = env.state()["vehicles"]
+    collision = (
+        vehicle_state[1]["x"] + vehicle_state[1]["length"] >= vehicle_state[0]["x"]
+        or vehicle_state[2]["x"] + vehicle_state[2]["length"] >= vehicle_state[1]["x"]
+    )
 
-    return EpisodeMetrics(
+    metrics = EpisodeMetrics(
         episode=-1,
         steps=step_count,
         collision=collision,
@@ -101,8 +475,43 @@ def run_episode(env: PlatoonEnv, agent: LLMAgent, episode_seed: int, temperature
         mean_reward=(total_r1 + total_r2) / 2.0,
         final_gap_error_agent_1=final_gap_err_1,
         final_gap_error_agent_2=final_gap_err_2,
+        mean_jerk=float(np.mean(jerk_values)) if jerk_values else 0.0,
         parse_failures=parse_failures,
+        parse_failure_rate=(parse_failures / (2.0 * max(step_count, 1))),
     )
+    return metrics, prompts
+
+
+def evaluate(agent: LLMAgent, eval_seeds: list[int]) -> dict[str, float]:
+    env = PlatoonEnv()
+    rows: list[EpisodeMetrics] = []
+    for seed in eval_seeds:
+        episode_metrics, _ = run_episode(env, agent, episode_seed=seed, temperature=0.0, collect_prompts=False)
+        rows.append(episode_metrics)
+
+    if not rows:
+        return {
+            "collision_rate": 1.0,
+            "mean_episode_reward": -999.0,
+            "mean_gap_error_final": 999.0,
+            "mean_jerk": 999.0,
+            "parse_failure_rate": 1.0,
+        }
+
+    return {
+        "collision_rate": float(np.mean([1.0 if row.collision else 0.0 for row in rows])),
+        "mean_episode_reward": float(np.mean([row.mean_reward for row in rows])),
+        "mean_gap_error_final": float(
+            np.mean(
+                [
+                    (abs(row.final_gap_error_agent_1) + abs(row.final_gap_error_agent_2)) / 2.0
+                    for row in rows
+                ]
+            )
+        ),
+        "mean_jerk": float(np.mean([row.mean_jerk for row in rows])),
+        "parse_failure_rate": float(np.mean([row.parse_failure_rate for row in rows])),
+    }
 
 
 def plot_training_curves(metrics_path: Path, reward_png: Path, loss_png: Path) -> None:
@@ -111,7 +520,7 @@ def plot_training_curves(metrics_path: Path, reward_png: Path, loss_png: Path) -
 
     episodes: list[int] = []
     rewards: list[float] = []
-    synthetic_losses: list[float] = []
+    losses: list[float] = []
 
     with metrics_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -120,7 +529,7 @@ def plot_training_curves(metrics_path: Path, reward_png: Path, loss_png: Path) -
                 continue
             episodes.append(int(item["episode"]))
             rewards.append(float(item["mean_reward"]))
-            synthetic_losses.append(max(0.0, 1.0 - (float(item["mean_reward"]) / -300.0)))
+            losses.append(float(item.get("proxy_loss", max(0.0, -item["mean_reward"] / 300.0))))
 
     if not episodes:
         return
@@ -137,7 +546,7 @@ def plot_training_curves(metrics_path: Path, reward_png: Path, loss_png: Path) -
     plt.close()
 
     plt.figure(figsize=(8, 4))
-    plt.plot(episodes, synthetic_losses, color="tab:orange")
+    plt.plot(episodes, losses, color="tab:orange")
     plt.xlabel("Episode")
     plt.ylabel("Proxy Loss")
     plt.title("Loss Curve")
@@ -146,111 +555,130 @@ def plot_training_curves(metrics_path: Path, reward_png: Path, loss_png: Path) -
     plt.close()
 
 
-def upload_checkpoint(local_dir: Path, repo_id: str, commit_message: str) -> None:
-    if not local_dir.exists():
-        return
-    upload_folder(
-        folder_path=str(local_dir),
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message=commit_message,
-    )
-
-
-def run_sft(args: argparse.Namespace, settings: dict[str, Any]) -> None:
-    print("Starting SFT flow")
-    output_dir = ROOT_DIR / "checkpoints" / "sft_final"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Placeholder training artifact for reproducible hackathon pipeline wiring.
-    metadata = {
-        "mode": "sft",
-        "epochs": args.epochs,
-        "base_model": args.base_model,
-        "dataset": "data/sft/scenario_01.jsonl",
-        "note": "Use training/platoon_colab.ipynb for full TRL SFT execution in Colab",
-    }
-    (output_dir / "sft_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-    hf_username = (Path(ROOT_DIR / ".env").read_text(encoding="utf-8") if (ROOT_DIR / ".env").exists() else "")
-    if "HF_USERNAME=" in hf_username:
-        value = [line.split("=", 1)[1].strip() for line in hf_username.splitlines() if line.startswith("HF_USERNAME=")]
-        if value and value[0] and value[0] != "your_hf_username":
-            upload_checkpoint(output_dir, f"{value[0]}/platoon-qwen-sft", "Upload SFT checkpoint")
-
-    print(f"SFT artifacts saved to {output_dir}")
-
-
 def run_rl(args: argparse.Namespace, settings: dict[str, Any]) -> None:
-    print("Starting RL flow")
-    env = PlatoonEnv()
-    agent = LLMAgent(base_model_name=args.base_model, adapter_path=args.adapter)
+    from agents.llm_agent import LLMAgent
 
+    print("Starting RL training")
     metrics_path = ROOT_DIR / settings["logging"]["metrics_path"]
     reward_png = ROOT_DIR / "results" / "reward_curve.png"
     loss_png = ROOT_DIR / "results" / "loss_curve.png"
 
-    rollout_buffer: list[dict[str, Any]] = []
+    if args.reset_metrics and metrics_path.exists():
+        metrics_path.unlink()
+
+    model, tokenizer = load_base_model_and_tokenizer(args.base_model, args.max_seq_len)
+
+    sft_path = ROOT_DIR / "checkpoints" / "sft_final"
+    adapter_path = args.adapter if args.adapter else (str(sft_path) if sft_path.exists() else None)
+    agent = LLMAgent(
+        base_model_name=args.base_model,
+        adapter_path=adapter_path,
+        max_new_tokens=args.max_new_tokens,
+    )
+
+    env = PlatoonEnv()
+    eval_seeds = settings.get("evaluation", {}).get("seeds", list(range(1001, 1011)))
+    max_prompts_per_update = int(settings.get("training_runtime", {}).get("max_prompts_per_update", 400))
+    prompt_buffer: list[str] = []
+
+    low_collision_windows = 0
 
     for episode in range(1, args.episodes + 1):
         episode_seed = args.seed + episode
-        ep = run_episode(env, agent, episode_seed=episode_seed, temperature=0.2)
-        ep.episode = episode
+        metrics, prompts = run_episode(
+            env,
+            agent,
+            episode_seed=episode_seed,
+            temperature=0.35,
+            collect_prompts=True,
+        )
+        metrics.episode = episode
+        prompt_buffer.extend(prompts)
 
-        episode_record = asdict(ep)
-        episode_record["event"] = "episode_end"
-        append_jsonl(metrics_path, episode_record)
+        proxy_loss = max(0.0, -metrics.mean_reward / 300.0)
+        row = asdict(metrics)
+        row.update({"event": "episode_end", "proxy_loss": proxy_loss})
+        append_jsonl(metrics_path, row)
 
-        rollout_buffer.append(episode_record)
+        if episode % args.grpo_update_every == 0 and prompt_buffer:
+            update_prompts = prompt_buffer[:max_prompts_per_update]
+            native_ok, native_mode = try_native_grpo_update(
+                model=model,
+                tokenizer=tokenizer,
+                prompts=update_prompts,
+                output_dir=ROOT_DIR / "checkpoints" / "tmp_grpo_update",
+                lr=args.lr_rl,
+                batch_size=args.batch_size,
+                grad_accum=args.grad_accum,
+                group_size=args.group_size,
+            )
 
-        if episode % args.grpo_update_every == 0:
+            selected_count = 0
+            if not native_ok:
+                selected = choose_group_best_actions(
+                    agent=agent,
+                    prompts=update_prompts,
+                    group_size=max(2, args.group_size),
+                )
+                selected_count = len(selected)
+
+                apply_grpo_style_update(
+                    model=model,
+                    tokenizer=tokenizer,
+                    samples=selected,
+                    output_dir=ROOT_DIR / "checkpoints" / "tmp_rl_update",
+                    lr=args.lr_rl,
+                    max_seq_len=args.max_seq_len,
+                    batch_size=args.batch_size,
+                    grad_accum=args.grad_accum,
+                )
+
+            prompt_buffer.clear()
             append_jsonl(
                 metrics_path,
                 {
                     "event": "grpo_update",
                     "episode": episode,
-                    "buffer_size": len(rollout_buffer),
-                    "note": "Run full GRPO update in Colab notebook with TRL GRPOTrainer",
+                    "native_grpo": native_ok,
+                    "mode": native_mode,
+                    "sample_count": selected_count,
+                    "group_size": args.group_size,
                 },
             )
-            rollout_buffer.clear()
 
         if episode % args.eval_every == 0:
-            eval_rewards = []
-            eval_collisions = 0
-            for idx in range(10):
-                ev = run_episode(env, agent, episode_seed=10_000 + idx, temperature=0.0)
-                eval_rewards.append(ev.mean_reward)
-                if ev.collision:
-                    eval_collisions += 1
+            eval_metrics = evaluate(agent, eval_seeds=eval_seeds)
+            append_jsonl(metrics_path, {"event": "evaluation", "episode": episode, **eval_metrics})
 
-            append_jsonl(
-                metrics_path,
-                {
-                    "event": "evaluation",
-                    "episode": episode,
-                    "mean_episode_reward": float(np.mean(eval_rewards)) if eval_rewards else 0.0,
-                    "collision_rate": eval_collisions / 10.0,
-                },
-            )
+            if eval_metrics["collision_rate"] < 0.05:
+                low_collision_windows += 1
+            else:
+                low_collision_windows = 0
+
+            if low_collision_windows >= 3:
+                append_jsonl(
+                    metrics_path,
+                    {
+                        "event": "early_stop",
+                        "episode": episode,
+                        "reason": "collision_rate_below_0_05_for_3_windows",
+                    },
+                )
+                print("Early stopping criterion met.")
+                break
 
         if episode % args.checkpoint_every == 0:
             ckpt_dir = ROOT_DIR / "checkpoints" / f"rl_ep{episode:03d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            (ckpt_dir / "rl_metadata.json").write_text(
-                json.dumps(
-                    {
-                        "episode": episode,
-                        "base_model": args.base_model,
-                        "note": "Adapter checkpoint saving/upload is wired; full GRPO learning happens in Colab",
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            model.save_pretrained(str(ckpt_dir))
+            tokenizer.save_pretrained(str(ckpt_dir))
+
+            hf_username = read_hf_username()
+            if hf_username and hf_username != "your_hf_username":
+                maybe_upload(ckpt_dir, f"{hf_username}/platoon-qwen-rl", f"Upload RL checkpoint episode {episode}")
 
     plot_training_curves(metrics_path, reward_png, loss_png)
-    print("RL run completed")
+    print("RL training completed")
 
 
 def main() -> None:
@@ -264,7 +692,7 @@ def main() -> None:
     seed_everything(args.seed)
 
     if args.sft:
-        run_sft(args, settings)
+        run_sft(args)
     if args.rl:
         run_rl(args, settings)
 

@@ -40,8 +40,8 @@ Local training is Linux-first. Native Windows is unsupported for model training.
 3. Install dependencies: `pip install -r requirements.txt`
 4. Fill `.env` with your HF username.
 5. Smoke test: `python -m environment.platoon_env --smoke-test`
-6. SFT wiring run: `python training/train_local.py --sft --epochs 1`
-7. RL wiring run: `python training/train_local.py --rl --episodes 10`
+6. SFT run: `python -m training.train_local --sft --epochs 1`
+7. RL run: `python -m training.train_local --rl --episodes 10`
 
 Judge rerun notebook: [training/platoon_colab.ipynb](training/platoon_colab.ipynb)
 
@@ -57,4 +57,5 @@ The environment tests whether LLMs can do short-horizon physical prediction usin
 ## Notes
 - Author: Tarun Aadhithya
 - Editable simulation knobs (max steps, velocity limits, dynamics) are in [config/platoon_settings.yaml](config/platoon_settings.yaml)
+- Editable evaluation seeds and RL runtime update limits are also in [config/platoon_settings.yaml](config/platoon_settings.yaml)
 - HF runtime variables are in [.env](.env)
