@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.env.local
+checkpoints/
+!checkpoints/.gitkeep
+_prd_extract/
+_prd_tmp.zip
+_prd_text.txt
+results/*.tmp
+.ipynb_checkpoints/

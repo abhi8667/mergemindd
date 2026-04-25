@@ -1,0 +1,2 @@
+{"event": "parse_failure", "timestep": 0, "agent_id": 1, "raw_action": "I am malformed output", "resolution": "default_coast"}
+{"event": "constraint_violation", "timestep": 0, "agent_id": 2, "raw_action": "ACTION:\naccel_pedal: 0.30\nbrake_pedal: 0.70", "resolution": "set_accel_to_zero_keep_brake"}

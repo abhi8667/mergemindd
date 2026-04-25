@@ -1,0 +1,40 @@
+name: platoon-rl-env
+version: "1.0.0"
+description: "Multi-agent vehicle platoon RL environment - cooperative emergency braking via physical state broadcasting"
+author: "Tarun Aadhithya"
+license: MIT
+environment:
+  class: PlatoonEnv
+  module: environment.platoon_env
+  observation_space: text
+  action_space: text
+  num_agents: 2
+  lead_car: scenario_controlled
+scenarios:
+  - name: scenario_01_brake
+    description: "Lead car hard brake and recovery - 350 steps - 5 phases"
+    max_steps: 350
+    num_llm_agents: 2
+    phases: [steady, brake_event, hold_low, recovery, steady_2]
+model:
+  base: Qwen/Qwen2.5-1.5B-Instruct
+  sft_checkpoint: "${HF_USERNAME}/platoon-qwen-sft"
+  rl_checkpoint: "${HF_USERNAME}/platoon-qwen-rl"
+training:
+  sft_epochs: 3
+  rl_episodes: 500
+  grpo_group_size: 4
+requirements:
+  python: ">=3.11"
+  packages:
+    - openenv>=0.1.0
+    - torch>=2.3.0
+    - transformers>=4.44.0
+    - unsloth>=2024.9.0
+    - trl>=0.11.0
+huggingface:
+  space_url: "https://huggingface.co/spaces/${HF_USERNAME}/platoon-rl-env"
+  space_hardware: "t4-small"
+  model_repos:
+    - "${HF_USERNAME}/platoon-qwen-sft"
+    - "${HF_USERNAME}/platoon-qwen-rl"

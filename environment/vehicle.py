@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass
+class Vehicle:
+    car_id: int
+    x: float
+    velocity: float
+    length: float = 4.5
+    width: float = 1.8
+    accel_pedal: float = 0.0
+    brake_pedal: float = 0.0
+    net_acceleration: float = 0.0
+    last_net_acceleration: float = 0.0
+
+    def apply_action(
+        self,
+        accel_pedal: float,
+        brake_pedal: float,
+        dt: float,
+        max_acceleration: float,
+        max_deceleration: float,
+        v_min: float,
+        v_max: float,
+    ) -> None:
+        accel = float(np.clip(accel_pedal, 0.0, 1.0))
+        brake = float(np.clip(brake_pedal, 0.0, 1.0))
+
+        if accel > 0.0 and brake > 0.0:
+            accel = 0.0
+
+        self.accel_pedal = accel
+        self.brake_pedal = brake
+
+        self.last_net_acceleration = self.net_acceleration
+        self.net_acceleration = (accel * max_acceleration) - (brake * max_deceleration)
+
+        self.x = self.x + (self.velocity * dt) + (0.5 * self.net_acceleration * dt * dt)
+        self.velocity = float(np.clip(self.velocity + self.net_acceleration * dt, v_min, v_max))
+
+    def to_broadcast_packet(self) -> dict[str, float | int]:
+        return {
+            "sender_id": int(self.car_id),
+            "x_position": float(self.x),
+            "velocity": float(self.velocity),
+            "accel_pedal": float(self.accel_pedal),
+            "brake_pedal": float(self.brake_pedal),
+            "net_acceleration": float(self.net_acceleration),
+            "length": float(self.length),
+            "width": float(self.width),
+        }
